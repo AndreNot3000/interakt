@@ -26,7 +26,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { JwtPayload } from '../../common/interfaces/jwt-payload.interface';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { TenantGuard } from '../../common/guards/tenant.guard';
-import { CalendarItemType } from '@prisma/client';
+import { CalendarItemType, AttendanceStatus } from '@prisma/client';
 
 export class CreateCalendarItemDto {
   @ApiProperty({ example: 'CSC 301 Midterm Examination' })
@@ -177,10 +177,11 @@ export class CalendarService {
     end: Date,
     type?: CalendarItemType,
   ) {
-    // 1. User's personal calendar items (exams, assignments, manual items)
+    // 1. User's personal calendar items (exams, assignments, manual items, excluding linked campus events)
     const personalItemsWhere: any = {
       userId,
       startDate: { gte: start, lte: end },
+      eventId: null,
     };
     if (type) personalItemsWhere.type = type;
 
@@ -198,6 +199,7 @@ export class CalendarService {
       const attendingEvents = await this.prisma.eventAttendee.findMany({
         where: {
           userId,
+          status: { in: [AttendanceStatus.REGISTERED, AttendanceStatus.INTERESTED] },
           event: {
             institutionId,
             startDate: { gte: start, lte: end },
@@ -213,6 +215,8 @@ export class CalendarService {
               startDate: true,
               endDate: true,
               category: true,
+              coverImageUrl: true,
+              organization: { select: { name: true } },
             },
           },
         },
@@ -227,10 +231,12 @@ export class CalendarService {
         startDate: a.event.startDate,
         endDate: a.event.endDate,
         allDay: false,
-        color: '#3b82f6',
+        color: '#8b5cf6',
         eventId: a.event.id,
         location: a.event.location,
         venue: a.event.location,
+        category: a.event.category,
+        organizer: a.event.organization?.name || 'Campus Event',
         status: a.status,
       }));
     }

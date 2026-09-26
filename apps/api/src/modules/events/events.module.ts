@@ -199,18 +199,41 @@ export class EventsService {
         groupId: dto.groupId,
         organizationId: dto.organizationId,
         courseId: dto.courseId,
+        attendeeCount: 1, // creator is registered
+      },
+    });
+
+    // Auto-register organizer as attendee
+    await this.prisma.eventAttendee.upsert({
+      where: { eventId_userId: { eventId: event.id, userId } },
+      update: { status: AttendanceStatus.REGISTERED },
+      create: {
+        eventId: event.id,
+        userId,
+        status: AttendanceStatus.REGISTERED,
       },
     });
 
     // Auto-create calendar item for organizer
-    await this.prisma.calendarItem.create({
-      data: {
+    await this.prisma.calendarItem.upsert({
+      where: { id: `event_${event.id}_${userId}` },
+      update: {
+        startDate: event.startDate,
+        endDate: event.endDate,
+        location: event.location,
+        title: event.title,
+        description: event.description,
+      },
+      create: {
+        id: `event_${event.id}_${userId}`,
         userId,
         title: event.title,
         description: event.description,
         type: CalendarItemType.EVENT,
         startDate: event.startDate,
         endDate: event.endDate,
+        location: event.location,
+        color: '#8b5cf6',
         eventId: event.id,
       },
     });
@@ -225,11 +248,13 @@ export class EventsService {
       page?: number;
       limit?: number;
       category?: EventCategory;
+      timeframe?: 'all' | 'upcoming' | 'today' | 'this_week' | 'past';
       upcomingOnly?: boolean;
       organizationId?: string;
       groupId?: string;
       courseId?: string;
       search?: string;
+      rsvpStatus?: 'all' | 'going' | 'interested' | 'my_rsvps';
     },
   ) {
     const { skip, take, page, limit } = getPaginationSkipTake(query.page, query.limit);
@@ -243,13 +268,52 @@ export class EventsService {
     if (query.organizationId) where.organizationId = query.organizationId;
     if (query.groupId) where.groupId = query.groupId;
     if (query.courseId) where.courseId = query.courseId;
-    if (query.upcomingOnly) {
-      where.endDate = { gte: new Date() };
+
+    const now = new Date();
+
+    if (query.timeframe === 'past') {
+      where.endDate = { lt: now };
+    } else if (query.timeframe === 'today') {
+      const startOfDay = new Date(now);
+      startOfDay.setHours(0, 0, 0, 0);
+      const endOfDay = new Date(now);
+      endOfDay.setHours(23, 59, 59, 999);
+      where.startDate = { lte: endOfDay };
+      where.endDate = { gte: startOfDay };
+    } else if (query.timeframe === 'this_week') {
+      const startOfWeek = new Date(now);
+      const day = startOfWeek.getDay();
+      const diff = startOfWeek.getDate() - day + (day === 0 ? -6 : 1);
+      startOfWeek.setDate(diff);
+      startOfWeek.setHours(0, 0, 0, 0);
+      const endOfWeek = new Date(startOfWeek);
+      endOfWeek.setDate(startOfWeek.getDate() + 6);
+      endOfWeek.setHours(23, 59, 59, 999);
+      where.startDate = { lte: endOfWeek };
+      where.endDate = { gte: startOfWeek };
+    } else if (query.upcomingOnly || query.timeframe === 'upcoming') {
+      where.endDate = { gte: now };
     }
-    if (query.search) {
+
+    if (query.rsvpStatus === 'going') {
+      where.attendees = { some: { userId, status: AttendanceStatus.REGISTERED } };
+    } else if (query.rsvpStatus === 'interested') {
+      where.attendees = { some: { userId, status: AttendanceStatus.INTERESTED } };
+    } else if (query.rsvpStatus === 'my_rsvps') {
+      where.attendees = {
+        some: {
+          userId,
+          status: { in: [AttendanceStatus.REGISTERED, AttendanceStatus.INTERESTED] },
+        },
+      };
+    }
+
+    if (query.search && query.search.trim()) {
+      const term = query.search.trim();
       where.OR = [
-        { title: { contains: query.search, mode: 'insensitive' } },
-        { location: { contains: query.search, mode: 'insensitive' } },
+        { title: { contains: term, mode: 'insensitive' } },
+        { description: { contains: term, mode: 'insensitive' } },
+        { location: { contains: term, mode: 'insensitive' } },
       ];
     }
 
@@ -271,11 +335,78 @@ export class EventsService {
       this.prisma.event.count({ where }),
     ]);
 
-    const formatted = events.map((event) => ({
-      ...event,
-      userStatus: event.attendees[0]?.status || null,
-      attendees: undefined,
-    }));
+    // Batch resolve student organizers for events without organization/group
+    const userOrganizerIds = Array.from(
+      new Set(
+        events
+          .filter((e) => !e.organization && !e.group && e.organizerId)
+          .map((e) => e.organizerId),
+      ),
+    );
+
+    const userOrganizers = userOrganizerIds.length > 0
+      ? await this.prisma.user.findMany({
+          where: { id: { in: userOrganizerIds } },
+          select: {
+            id: true,
+            role: true,
+            profile: {
+              select: {
+                displayName: true,
+                firstName: true,
+                lastName: true,
+                avatarUrl: true,
+              },
+            },
+          },
+        })
+      : [];
+    const userMap = new Map(userOrganizers.map((u) => [u.id, u]));
+
+    const formatted = events.map((event) => {
+      let organizer: {
+        id: string;
+        name: string;
+        type: 'organization' | 'group' | 'user';
+        avatarUrl?: string | null;
+        isOfficial?: boolean;
+      };
+
+      if (event.organization) {
+        organizer = {
+          id: event.organization.id,
+          name: event.organization.name,
+          type: 'organization',
+          avatarUrl: event.organization.avatarUrl,
+          isOfficial: event.organization.isOfficial,
+        };
+      } else if (event.group) {
+        organizer = {
+          id: event.group.id,
+          name: event.group.name,
+          type: 'group',
+          avatarUrl: event.group.avatarUrl,
+        };
+      } else {
+        const u = userMap.get(event.organizerId);
+        const uName =
+          u?.profile?.displayName ||
+          (u?.profile ? `${u.profile.firstName} ${u.profile.lastName}`.trim() : 'Campus Community');
+        organizer = {
+          id: event.organizerId,
+          name: uName || 'Campus Community',
+          type: 'user',
+          avatarUrl: u?.profile?.avatarUrl || null,
+        };
+      }
+
+      return {
+        ...event,
+        organizer,
+        userStatus: event.attendees[0]?.status || null,
+        attendees: undefined,
+      };
+    });
 
     return paginate(formatted, total, page, limit);
   }
@@ -285,7 +416,7 @@ export class EventsService {
       where: { id, institutionId },
       include: {
         organization: { select: { id: true, name: true, avatarUrl: true, isOfficial: true } },
-        group: { select: { id: true, name: true } },
+        group: { select: { id: true, name: true, avatarUrl: true } },
         attendees: {
           where: { userId },
           select: { status: true },
@@ -295,8 +426,58 @@ export class EventsService {
 
     if (!event) throw new NotFoundException('Event not found.');
 
+    let organizer: {
+      id: string;
+      name: string;
+      type: 'organization' | 'group' | 'user';
+      avatarUrl?: string | null;
+      isOfficial?: boolean;
+    };
+
+    if (event.organization) {
+      organizer = {
+        id: event.organization.id,
+        name: event.organization.name,
+        type: 'organization',
+        avatarUrl: event.organization.avatarUrl,
+        isOfficial: event.organization.isOfficial,
+      };
+    } else if (event.group) {
+      organizer = {
+        id: event.group.id,
+        name: event.group.name,
+        type: 'group',
+        avatarUrl: event.group.avatarUrl,
+      };
+    } else {
+      const u = await this.prisma.user.findUnique({
+        where: { id: event.organizerId },
+        select: {
+          id: true,
+          profile: {
+            select: {
+              displayName: true,
+              firstName: true,
+              lastName: true,
+              avatarUrl: true,
+            },
+          },
+        },
+      });
+      const uName =
+        u?.profile?.displayName ||
+        (u?.profile ? `${u.profile.firstName} ${u.profile.lastName}`.trim() : 'Campus Community');
+      organizer = {
+        id: event.organizerId,
+        name: uName || 'Campus Community',
+        type: 'user',
+        avatarUrl: u?.profile?.avatarUrl || null,
+      };
+    }
+
     return {
       ...event,
+      organizer,
       userStatus: event.attendees[0]?.status || null,
       attendees: undefined,
     };
@@ -306,14 +487,33 @@ export class EventsService {
     institutionId: string,
     eventId: string,
     userId: string,
-    status: AttendanceStatus,
+    rawStatus: AttendanceStatus | string,
   ) {
     const event = await this.prisma.event.findFirst({
       where: { id: eventId, institutionId },
     });
     if (!event) throw new NotFoundException('Event not found.');
 
-    if (status === AttendanceStatus.REGISTERED && event.capacity) {
+    const statusUpper = String(rawStatus || '').toUpperCase();
+    let targetStatus: AttendanceStatus = AttendanceStatus.INTERESTED;
+
+    if (statusUpper === 'REGISTERED' || statusUpper === 'GOING' || statusUpper === 'ATTENDING') {
+      targetStatus = AttendanceStatus.REGISTERED;
+    } else if (statusUpper === 'INTERESTED') {
+      targetStatus = AttendanceStatus.INTERESTED;
+    } else if (statusUpper === 'CANCEL' || statusUpper === 'CANCELLED' || statusUpper === 'NONE') {
+      return this.cancelAttendance(eventId, userId);
+    }
+
+    const existing = await this.prisma.eventAttendee.findUnique({
+      where: { eventId_userId: { eventId, userId } },
+    });
+
+    if (
+      targetStatus === AttendanceStatus.REGISTERED &&
+      event.capacity &&
+      existing?.status !== AttendanceStatus.REGISTERED
+    ) {
       const registeredCount = await this.prisma.eventAttendee.count({
         where: { eventId, status: AttendanceStatus.REGISTERED },
       });
@@ -324,32 +524,35 @@ export class EventsService {
 
     await this.prisma.eventAttendee.upsert({
       where: { eventId_userId: { eventId, userId } },
-      update: { status },
-      create: { eventId, userId, status },
+      update: { status: targetStatus },
+      create: { eventId, userId, status: targetStatus },
     });
 
-    // Sync to user calendar
-    if (status === AttendanceStatus.REGISTERED || status === AttendanceStatus.INTERESTED) {
-      await this.prisma.calendarItem.upsert({
-        where: { id: `event_${eventId}_${userId}` },
-        update: {
-          startDate: event.startDate,
-          endDate: event.endDate,
-        },
-        create: {
-          id: `event_${eventId}_${userId}`,
-          userId,
-          title: event.title,
-          description: event.description,
-          type: CalendarItemType.EVENT,
-          startDate: event.startDate,
-          endDate: event.endDate,
-          eventId: event.id,
-        },
-      });
-    }
+    // Synchronize to student's personal calendar
+    await this.prisma.calendarItem.upsert({
+      where: { id: `event_${eventId}_${userId}` },
+      update: {
+        startDate: event.startDate,
+        endDate: event.endDate,
+        location: event.location,
+        title: event.title,
+        description: event.description,
+      },
+      create: {
+        id: `event_${eventId}_${userId}`,
+        userId,
+        title: event.title,
+        description: event.description,
+        type: CalendarItemType.EVENT,
+        startDate: event.startDate,
+        endDate: event.endDate,
+        location: event.location,
+        color: '#8b5cf6',
+        eventId: event.id,
+      },
+    });
 
-    // Refresh counts
+    // Refresh denormalized counts
     const [attendeeCount, interestedCount] = await Promise.all([
       this.prisma.eventAttendee.count({ where: { eventId, status: AttendanceStatus.REGISTERED } }),
       this.prisma.eventAttendee.count({ where: { eventId, status: AttendanceStatus.INTERESTED } }),
@@ -360,7 +563,16 @@ export class EventsService {
       data: { attendeeCount, interestedCount },
     });
 
-    return { success: true, status, message: `Event marked as ${status.toLowerCase()}.` };
+    return {
+      success: true,
+      status: targetStatus,
+      attendeeCount,
+      interestedCount,
+      message:
+        targetStatus === AttendanceStatus.REGISTERED
+          ? 'Registered for event! Added to your campus calendar.'
+          : 'Marked as interested! Added to your campus calendar.',
+    };
   }
 
   async cancelAttendance(eventId: string, userId: string) {
@@ -373,7 +585,23 @@ export class EventsService {
       where: { eventId, userId },
     });
 
-    return { success: true, message: 'Attendance cancelled.' };
+    const [attendeeCount, interestedCount] = await Promise.all([
+      this.prisma.eventAttendee.count({ where: { eventId, status: AttendanceStatus.REGISTERED } }),
+      this.prisma.eventAttendee.count({ where: { eventId, status: AttendanceStatus.INTERESTED } }),
+    ]);
+
+    await this.prisma.event.update({
+      where: { id: eventId },
+      data: { attendeeCount, interestedCount },
+    });
+
+    return {
+      success: true,
+      status: null,
+      attendeeCount,
+      interestedCount,
+      message: 'RSVP cancelled and removed from your calendar.',
+    };
   }
 }
 
@@ -397,21 +625,25 @@ export class EventsController {
     @Query('page') page?: number,
     @Query('limit') limit?: number,
     @Query('category') category?: EventCategory,
+    @Query('timeframe') timeframe?: 'all' | 'upcoming' | 'today' | 'this_week' | 'past',
     @Query('upcomingOnly') upcomingOnly?: boolean,
     @Query('organizationId') organizationId?: string,
     @Query('groupId') groupId?: string,
     @Query('courseId') courseId?: string,
     @Query('search') search?: string,
+    @Query('rsvpStatus') rsvpStatus?: 'all' | 'going' | 'interested' | 'my_rsvps',
   ) {
     return this.eventsService.findAll(user.institutionId, user.sub, {
       page: page ? Number(page) : 1,
       limit: limit ? Number(limit) : 20,
       category,
+      timeframe,
       upcomingOnly: upcomingOnly === true || String(upcomingOnly) === 'true',
       organizationId,
       groupId,
       courseId,
       search,
+      rsvpStatus,
     });
   }
 
@@ -426,8 +658,9 @@ export class EventsController {
   async rsvpEvent(
     @CurrentUser() user: JwtPayload,
     @Param('id') id: string,
-    @Body('status') status: AttendanceStatus,
+    @Body() body: any,
   ) {
+    const status = body?.status || body;
     return this.eventsService.setAttendance(user.institutionId, id, user.sub, status);
   }
 
@@ -437,6 +670,7 @@ export class EventsController {
     return this.eventsService.cancelAttendance(id, user.sub);
   }
 }
+
 
 @Module({
   controllers: [EventsController],
