@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Turbo
+.turbo/
+
+# Test coverage
+coverage/
+
+# Prisma
+*.db
+*.db-journal
+
+# Flutter
+.dart_tool/
+.packages
+*.iml
+.flutter-plugins
+.flutter-plugins-dependencies
